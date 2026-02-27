@@ -2,13 +2,10 @@ package domain
 
 import "time"
 
-// FlagType represents the type of a feature flag value.
 type FlagType string
 
 const (
-	// FlagTypeBoolean indicates a boolean feature flag.
 	FlagTypeBoolean FlagType = "boolean"
-	// FlagTypeNumeric indicates a numeric (float64) feature flag.
 	FlagTypeNumeric FlagType = "numeric"
 )
 
@@ -19,7 +16,6 @@ type FlagValue struct {
 	Numeric *float64
 }
 
-// Flag represents a feature flag domain entity.
 type Flag struct {
 	Name        string
 	Type        FlagType
