@@ -2,393 +2,147 @@
 
 ## 1. Overview
 
-The Feature Flags Service is a lightweight REST API that stores and serves feature flag values. It supports two flag types — **boolean** and **numeric** — and uses a two-storage model:
+The Feature Flags Service is a REST API for creating and evaluating feature flags. It supports two value types: **boolean** and **numeric**.
 
-- **PostgreSQL** — authoritative store for all flag data including metadata.
-- **Redis** — fast read cache for flag values on the hot read path.
+The service uses a two-storage model:
 
-Writes go to Postgres first (hard fail on error), then to Redis (soft fail: cache inconsistency is tolerated because reads fall back to Postgres and repopulate the cache automatically).
+- **PostgreSQL** — authoritative store for all flag data, including metadata such as description and timestamps.
+- **Redis** — fast read cache for flag values on the hot path.
+
+Writes always go to Postgres first. Redis is updated after a successful Postgres write. This allows the system to degrade gracefully under a Redis outage: reads fall back to Postgres and the cache self-heals on the next read.
 
 ---
 
 ## 2. Architecture Style — Hexagonal (Ports & Adapters)
 
-The service is structured in three concentric rings:
+The service is structured in three concentric rings with a strict inward dependency rule: outer rings depend on inner rings, never the reverse.
 
 ```
-┌──────────────────────────────────────────────┐
-│  Adapters (HTTP, Postgres, Redis)            │
-│  ┌────────────────────────────────────────┐  │
-│  │  Ports (interfaces)                   │  │
-│  │  ┌──────────────────────────────────┐ │  │
-│  │  │  Domain (Flag, FlagValue, errors)│ │  │
-│  │  └──────────────────────────────────┘ │  │
-│  └────────────────────────────────────────┘  │
-└──────────────────────────────────────────────┘
+┌───────────────────────────────────────────┐
+│  Adapters  (HTTP, Postgres, Redis)        │
+│  ┌─────────────────────────────────────┐  │
+│  │  Ports  (interfaces)               │  │
+│  │  ┌───────────────────────────────┐ │  │
+│  │  │  Domain  (entities, errors)   │ │  │
+│  │  └───────────────────────────────┘ │  │
+│  └─────────────────────────────────────┘  │
+└───────────────────────────────────────────┘
 ```
 
-- **`internal/domain/`** — zero external dependencies; defines core entities and error sentinels. Everything else depends on what is defined here.
-- **`internal/port/`** — interfaces only; defines the boundaries between rings. Neither domain nor adapters depend on each other — they both depend on ports.
-- **`internal/adapter/`** — concrete implementations of ports (HTTP handler, Postgres store, Redis cache). Know about `domain` and `port` but never about `service`.
-- **`internal/service/`** — application logic. Depends on `domain` and `port`. Knows nothing about HTTP, Postgres, or Redis.
-- **`cmd/server/main.go`** — single composition root; wires all adapters together and starts the server.
+- **Domain** — core entities and error definitions; zero external dependencies.
+- **Ports** — Go interfaces that define the boundaries between rings. Both the service layer and adapters depend on ports, never on each other.
+- **Service** — application logic. Knows about domain and ports; knows nothing about HTTP, Postgres, or Redis.
+- **Adapters** — concrete implementations of port interfaces. The HTTP adapter drives the service (primary/inbound); the Postgres and Redis adapters are driven by the service (secondary/outbound).
+- **`cmd/server/main.go`** — the single composition root where all adapters are wired together and the HTTP server is started.
 
 ---
 
 ## 3. Package Structure
 
-Tests live in the **same directory** as the code they test (standard Go convention). Integration tests carry a `//go:build integration` tag and are excluded from plain `go test ./...` runs.
+`_test.go` files live beside the code they test (standard Go convention). Integration tests carry a `//go:build integration` build tag so they are excluded from a plain `go test ./...` run.
 
 ```
 feature-flags/
 ├── cmd/server/
-│   ├── main.go                       # Composition root — wires adapters, starts HTTP server
-│   └── main_test.go                  # End-to-end HTTP tests  [build tag: integration]
+│   ├── main.go          # Composition root — wires adapters, starts HTTP server
+│   └── main_test.go     # End-to-end HTTP tests  [build tag: integration]
 │
 ├── internal/
-│   ├── domain/
-│   │   ├── flag.go                   # Flag entity, FlagType enum, FlagValue type
-│   │   ├── flag_test.go              # Domain logic unit tests
-│   │   └── errors.go                 # Sentinel errors (ErrNotFound, ErrAlreadyExists, …)
-│   │
-│   ├── port/
-│   │   ├── service.go                # FlagService interface (primary / inbound port)
-│   │   ├── store.go                  # FlagStore interface (secondary / outbound → Postgres)
-│   │   └── cache.go                  # FlagCache interface (secondary / outbound → Redis)
-│   │
-│   ├── service/
-│   │   ├── flag_service.go           # FlagService implementation (core application logic)
-│   │   └── flag_service_test.go      # Unit tests with hand-written fakes
-│   │
+│   ├── domain/          # Flag entity, FlagType enum, FlagValue type, error sentinels
+│   ├── port/            # Interfaces: FlagService (inbound), FlagStore, FlagCache (outbound)
+│   ├── service/         # FlagService implementation (core application logic)
 │   ├── adapter/
-│   │   ├── http/
-│   │   │   ├── handler.go            # HTTP handler (primary adapter)
-│   │   │   ├── handler_test.go       # Unit tests via net/http/httptest
-│   │   │   ├── router.go             # Route registration
-│   │   │   ├── dto.go                # Request / response structs + JSON marshaling
-│   │   │   └── middleware.go         # Logging, recovery, request-ID middleware
-│   │   │
-│   │   ├── postgres/
-│   │   │   ├── flag_store.go         # FlagStore implementation (secondary adapter)
-│   │   │   ├── flag_store_test.go    # Integration tests  [build tag: integration]
-│   │   │   └── migrations/
-│   │   │       └── 001_create_flags.sql
-│   │   │
-│   │   └── redis/
-│   │       ├── flag_cache.go         # FlagCache implementation (secondary adapter)
-│   │       └── flag_cache_test.go    # Integration tests  [build tag: integration]
-│   │
-│   ├── testutil/
-│   │   ├── db.go                     # Shared helper: Postgres container bootstrap
-│   │   └── redis.go                  # Shared helper: Redis container bootstrap
-│   │
-│   └── config/
-│       └── config.go                 # Env-var loading (DB DSN, Redis addr, port, …)
+│   │   ├── http/        # REST handler, router, request/response DTOs, middleware
+│   │   ├── postgres/    # FlagStore implementation; SQL migrations
+│   │   └── redis/       # FlagCache implementation
+│   ├── testutil/        # Shared integration-test helpers (container lifecycle)
+│   └── config/          # Environment variable loading
 │
-├── docker-compose.yml                # Local dev: Postgres + Redis
-├── .env.example
-└── architecture.md
+└── docker-compose.yml   # Local dev: Postgres + Redis
 ```
 
-**Why `internal/testutil/` and not a top-level `test/` directory:**
-
-- Test helpers shared across packages belong in `internal/testutil/` — importable by any `internal/` package without being a public API.
-- A top-level `test/` directory is a Java/Python convention and is not idiomatic in Go. Go's toolchain discovers tests purely by the `_test.go` file suffix within each package directory.
-- The `//go:build integration` tag separates integration tests from unit tests without directory games:
-  - `go test ./...` — runs only unit tests.
-  - `go test -tags integration ./...` — runs everything.
+`internal/testutil/` is used instead of a top-level `test/` directory because shared test helpers need to be importable by other `internal/` packages without becoming a public API. A top-level `test/` directory is not idiomatic in Go.
 
 ---
 
 ## 4. Domain Model
 
-### `internal/domain/flag.go`
+A **Flag** has a name, a type, a description, a value, and created/updated timestamps. The name is the natural primary key — lowercase letters, digits, and hyphens only, starting with a letter, maximum 63 characters.
 
-```go
-package domain
-
-import "time"
-
-type FlagType string
-
-const (
-    FlagTypeBoolean FlagType = "boolean"
-    FlagTypeNumeric FlagType = "numeric"
-)
-
-// FlagValue holds the actual value. Exactly one field is non-nil,
-// determined by the parent Flag.Type. Pointer fields ensure that
-// false and 0.0 are distinguishable from "not set".
-type FlagValue struct {
-    Boolean *bool
-    Numeric *float64
-}
-
-type Flag struct {
-    Name        string    // natural primary key, e.g. "dark-mode"
-    Type        FlagType
-    Description string
-    Value       FlagValue
-    CreatedAt   time.Time
-    UpdatedAt   time.Time
-}
-```
-
-**Flag naming rules:** must match `^[a-z][a-z0-9\-]{0,62}$` — starts with a lowercase letter, contains only lowercase letters, digits, and hyphens, maximum 63 characters total.
-
-### `internal/domain/errors.go`
-
-```go
-package domain
-
-import "errors"
-
-var ErrNotFound      = errors.New("flag not found")
-var ErrAlreadyExists = errors.New("flag already exists")
-var ErrTypeMismatch  = errors.New("value type does not match flag type")
-var ErrInvalidFlagName = errors.New("invalid flag name")
-var ErrInvalidValue  = errors.New("invalid flag value")
-```
-
-Callers use `errors.Is` so that wrapped errors (`fmt.Errorf("postgres: %w", domain.ErrNotFound)`) are handled correctly.
+A flag's **type** is either `boolean` or `numeric` and is immutable after creation. The **value** is typed by the flag's declared type: a boolean flag holds a true/false value; a numeric flag holds a decimal number (sufficient to represent both integers and fractional values like percentage thresholds).
 
 ---
 
-## 5. Port Interfaces
+## 5. Component Responsibilities
 
-### `internal/port/service.go` — Primary (inbound) port
+**FlagService** owns all application logic: validating flag names and values, enforcing type consistency between a flag's declared type and incoming values, orchestrating reads and writes across the store and cache, and deciding how to handle cache failures. It has no knowledge of HTTP, SQL, or Redis.
 
-```go
-type FlagService interface {
-    CreateFlag(ctx context.Context, flag domain.Flag) (domain.Flag, error)
-    GetFlag(ctx context.Context, name string) (domain.Flag, error)
-    GetFlagValue(ctx context.Context, name string) (domain.FlagValue, error)
-    UpdateFlagValue(ctx context.Context, name string, value domain.FlagValue) (domain.Flag, error)
-}
-```
+**Postgres adapter (FlagStore)** is responsible for durable persistence: inserting flags, looking them up by name, and updating values. It is the only place where domain types are mapped to and from database columns.
 
-### `internal/port/store.go` — Secondary (outbound) port — Postgres
+**Redis adapter (FlagCache)** is responsible for the fast read path: storing and retrieving flag values with a type discriminator so the value can be correctly decoded without a second lookup. It translates Redis-specific errors (key not found, connection failure) into the uniform domain error that callers expect.
 
-```go
-type FlagStore interface {
-    Save(ctx context.Context, flag domain.Flag) (domain.Flag, error)
-    FindByName(ctx context.Context, name string) (domain.Flag, error)
-    UpdateValue(ctx context.Context, name string, value domain.FlagValue) (domain.Flag, error)
-}
-```
-
-### `internal/port/cache.go` — Secondary (outbound) port — Redis
-
-```go
-type FlagCache interface {
-    Set(ctx context.Context, name string, value domain.FlagValue) error
-    Get(ctx context.Context, name string) (domain.FlagValue, error) // ErrNotFound on miss
-    Delete(ctx context.Context, name string) error                  // no-op if missing
-}
-```
-
-`Get` returns `domain.ErrNotFound` on a cache miss — callers do not need to know whether the key was absent or Redis was unreachable; the fallback behaviour is identical.
+**HTTP adapter** is responsible for parsing and validating requests, calling the service, serialising responses, and mapping domain errors to appropriate HTTP status codes and JSON error bodies. It contains no business logic.
 
 ---
 
-## 6. Data Model
+## 6. Data Storage
 
-### PostgreSQL Schema
+### PostgreSQL
 
-```sql
--- internal/adapter/postgres/migrations/001_create_flags.sql
+The `flags` table stores each flag's name (primary key), type, description, timestamps, and two nullable value columns — one for boolean values and one for numeric values. A database-level constraint ensures that exactly one value column is populated, matching the flag's declared type.
 
-CREATE TYPE flag_type AS ENUM ('boolean', 'numeric');
+Two separate columns are used instead of a single JSON column so that the type constraint can be enforced by the database, reads require no deserialization, and value columns are individually indexable if needed.
 
-CREATE TABLE flags (
-    name         TEXT        PRIMARY KEY
-        CHECK (name ~ '^[a-z][a-z0-9\-]{0,62}$'),
-    type         flag_type   NOT NULL,
-    description  TEXT        NOT NULL DEFAULT '',
-    bool_value   BOOLEAN,
-    num_value    NUMERIC(20,6),
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+### Redis
 
-    CONSTRAINT value_matches_type CHECK (
-        (type = 'boolean' AND bool_value IS NOT NULL AND num_value IS NULL)
-        OR
-        (type = 'numeric' AND num_value IS NOT NULL AND bool_value IS NULL)
-    )
-);
+Keys follow the pattern `flags:value:{name}`. Values are plain strings with a short type prefix so that a single `GET` retrieves both the type discriminator and the value — no additional round-trips, and values remain human-readable via `redis-cli`.
 
-CREATE INDEX idx_flags_type ON flags (type);
-```
-
-**Design notes:**
-- Two value columns (`bool_value`, `num_value`) rather than a single `JSONB` column: keeps the CHECK constraint in pure SQL, allows type-safe reads without deserialization, and makes columns indexable.
-- `NUMERIC(20,6)` avoids floating-point rounding artefacts in the DB layer.
-- The `CHECK` on `name` is a last line of defence; the service validates first so error messages are controlled.
-- `updated_at` is set by the application layer (not a DB trigger) so integration tests can inject a fixed timestamp.
-
-### Redis Key Schema
-
-**Pattern:** `flags:value:{name}`
-
-**Value encoding:** plain string with a type prefix.
-
-| Flag type | Example stored value |
-|-----------|---------------------|
-| boolean   | `b:true` / `b:false` |
-| numeric   | `n:30.5` / `n:100`  |
-
-A single `GET` retrieves both the type discriminator and the value — no additional round-trips. Values are human-readable via `redis-cli GET`.
-
-**TTL policy:** no TTL by default. Write-through keeps the cache consistent. A configurable `CACHE_TTL_SECONDS` can be added as a safety net against edge cases.
+No TTL is set by default. The write-through strategy keeps the cache consistent with Postgres. On a cache miss the service falls back to Postgres and repopulates the cache automatically.
 
 ---
 
 ## 7. API Catalogue
 
-All responses use `Content-Type: application/json`.
+All responses use `Content-Type: application/json`. Errors share a common envelope with a machine-readable `code` field and a human-readable `message`.
 
-### Common Error Envelope
-
-```json
-{
-  "error": {
-    "code":    "NOT_FOUND",
-    "message": "flag 'dark-mode' not found"
-  }
-}
-```
+| Method | Path                  | Description                              | Success |
+|--------|-----------------------|------------------------------------------|---------|
+| POST   | /flags                | Create a new flag                        | 201     |
+| GET    | /flags/:name          | Full flag detail; always reads Postgres  | 200     |
+| GET    | /flags/:name/value    | Flag value; Redis-first, Postgres fallback | 200   |
+| PUT    | /flags/:name/value    | Update value; write-through to both stores | 200  |
 
 ---
 
-### POST /flags — Create a flag
-
-**Request body:**
-```json
-{
-  "name":        "dark-mode",
-  "type":        "boolean",
-  "description": "Enables dark mode for all users",
-  "value":       true
-}
-```
-
-`value` is a raw JSON boolean or number — not a wrapped object. The HTTP adapter uses `type` to determine how to parse it.
-
-**Success: 201 Created**
-```json
-{
-  "name":        "dark-mode",
-  "type":        "boolean",
-  "description": "Enables dark mode for all users",
-  "value":       true,
-  "created_at":  "2026-02-27T10:00:00Z",
-  "updated_at":  "2026-02-27T10:00:00Z"
-}
-```
-
-**Errors:**
-
-| HTTP | Code             | Condition                                    |
-|------|------------------|----------------------------------------------|
-| 400  | `INVALID_NAME`   | Name is empty, too long, or contains illegal characters |
-| 400  | `INVALID_VALUE`  | Value missing or wrong JSON kind             |
-| 400  | `INVALID_TYPE`   | Type not `"boolean"` or `"numeric"`          |
-| 409  | `ALREADY_EXISTS` | A flag with this name already exists         |
-
----
-
-### GET /flags/:name — Full flag detail
-
-Always reads from PostgreSQL. Never touches Redis.
-
-**Success: 200 OK**
-```json
-{
-  "name":        "dark-mode",
-  "type":        "boolean",
-  "description": "Enables dark mode for all users",
-  "value":       true,
-  "created_at":  "2026-02-27T10:00:00Z",
-  "updated_at":  "2026-02-27T10:00:00Z"
-}
-```
-
-**Errors:**
-
-| HTTP | Code        | Condition           |
-|------|-------------|---------------------|
-| 404  | `NOT_FOUND` | Flag does not exist |
-
----
-
-### GET /flags/:name/value — Cached value read
-
-Redis-first, Postgres fallback.
-
-**Success: 200 OK**
-```json
-{ "name": "dark-mode",        "type": "boolean", "value": true }
-{ "name": "request-timeout",  "type": "numeric",  "value": 30.5 }
-```
-
-**Errors:**
-
-| HTTP | Code        | Condition           |
-|------|-------------|---------------------|
-| 404  | `NOT_FOUND` | Flag does not exist |
-
----
-
-### PUT /flags/:name/value — Update flag value (write-through)
-
-**Request body:**
-```json
-{ "value": false }
-{ "value": 42.0  }
-```
-
-The server resolves the expected JSON kind from the flag's stored type. A mismatch returns `TYPE_MISMATCH`.
-
-**Success: 200 OK** — returns the full updated flag detail (same shape as GET /flags/:name).
-
-**Errors:**
-
-| HTTP | Code            | Condition                                          |
-|------|-----------------|----------------------------------------------------|
-| 400  | `INVALID_VALUE` | Body is missing, malformed JSON, or value is null  |
-| 400  | `TYPE_MISMATCH` | JSON kind of `value` contradicts flag's type       |
-| 404  | `NOT_FOUND`     | Flag does not exist                                |
-
----
-
-## 8. Write-Through Flow (PUT /flags/:name/value)
+## 8. Write-Through Flow
 
 ```
-HTTP Client  →  PUT /flags/dark-mode/value  { "value": false }
-                              │
-                   ┌──────────▼──────────┐
-                   │   HTTP Handler       │  1. Parse + validate request body
-                   └──────────┬──────────┘
-                              │
-                   ┌──────────▼──────────┐
-                   │   FlagService        │  2. FindByName → ErrNotFound? → 404
-                   │                      │  3. Type match check → ErrTypeMismatch? → 400
-                   │                      │  4. FlagStore.UpdateValue (Postgres)
-                   │                      │     HARD FAIL if Postgres errors → do not touch Redis
-                   │                      │  5. FlagCache.Set (Redis)
-                   │                      │     SOFT FAIL: log WARN, return 200 anyway
-                   └──────────┬──────────┘
-                              │
-                   ┌──────────▼──────────┐
-                   │   HTTP Handler       │  6. Serialise updated Flag → 200 OK
-                   └─────────────────────┘
+Client  →  PUT /flags/:name/value
+                     │
+            ┌────────▼────────┐
+            │  HTTP Handler    │  Parse and validate request
+            └────────┬────────┘
+                     │
+            ┌────────▼────────┐
+            │  FlagService     │  Load flag from Postgres
+            │                  │  → not found? return 404
+            │                  │
+            │                  │  Validate type match
+            │                  │  → mismatch? return 400
+            │                  │
+            │                  │  Write to Postgres  ← HARD FAIL
+            │                  │  → error? return 5xx; do not touch Redis
+            │                  │
+            │                  │  Write to Redis     ← SOFT FAIL
+            │                  │  → error? log WARN; return 200 anyway
+            └────────┬────────┘
+                     │
+            ┌────────▼────────┐
+            │  HTTP Handler    │  Serialise updated flag → 200 OK
+            └─────────────────┘
 ```
 
-**Redis failure asymmetry:**
-- **Postgres failure (step 4):** hard fail — value not persisted, return 5xx, do not touch Redis.
-- **Redis failure (step 5):** soft fail — value IS persisted in Postgres (source of truth). Log a WARN. The next `/value` read will miss Redis, fall back to Postgres, read the correct value, and repopulate the cache automatically. No data loss, no client-visible error on writes.
-
-**POST /flags write flow** follows the same pattern: save to Postgres first, then populate cache (soft-fail on Redis error).
+**Failure asymmetry:** a Postgres write failure means the value was not persisted — the request fails. A Redis write failure means the value is safely in Postgres but the cache is stale; the next read will miss Redis, fall back to Postgres, get the correct value, and repopulate the cache. No data is lost and no write error is surfaced to the caller.
 
 ---
 
@@ -396,152 +150,48 @@ HTTP Client  →  PUT /flags/dark-mode/value  { "value": false }
 
 ### GET /flags/:name — Full Detail
 
-```
-FlagService.GetFlag
-  └─ FlagStore.FindByName (Postgres)
-       ├─ Found  → return Flag → 200 OK
-       └─ Missing → ErrNotFound → 404
-```
-
-Redis is never consulted. The full detail response includes metadata (`description`, `created_at`, `updated_at`) not cached in Redis; fetching that separately would add complexity for a non-hot-path endpoint.
+Always reads from Postgres. Redis is not consulted because the full response includes metadata (description, timestamps) that is not cached.
 
 ### GET /flags/:name/value — Cached Value
 
 ```
 FlagService.GetFlagValue
-  └─ FlagCache.Get (Redis)
-       ├─ Cache HIT  → decode prefix → return FlagValue → 200 OK  (no Postgres query)
-       └─ Cache MISS or Redis down → ErrNotFound
-            └─ FlagStore.FindByName (Postgres)
-                 ├─ Found  → FlagCache.Set (soft-fail) → return FlagValue → 200 OK
-                 └─ Missing → ErrNotFound → 404
+  │
+  ├─ Redis GET
+  │    ├─ HIT  → decode value → return immediately (no Postgres query)
+  │    └─ MISS or Redis unavailable
+  │         └─ Postgres SELECT
+  │              ├─ found   → populate Redis cache (soft-fail) → return value
+  │              └─ missing → 404
 ```
 
 ---
 
-## 10. Error Catalogue
+## 10. Error Handling
 
-### Domain Errors → HTTP Mapping
+Domain errors map to specific HTTP responses:
 
-```go
-func domainErrToHTTP(err error) (int, string) {
-    switch {
-    case errors.Is(err, domain.ErrNotFound):        return 404, "NOT_FOUND"
-    case errors.Is(err, domain.ErrAlreadyExists):   return 409, "ALREADY_EXISTS"
-    case errors.Is(err, domain.ErrTypeMismatch):    return 400, "TYPE_MISMATCH"
-    case errors.Is(err, domain.ErrInvalidFlagName): return 400, "INVALID_NAME"
-    case errors.Is(err, domain.ErrInvalidValue):    return 400, "INVALID_VALUE"
-    default:                                        return 500, "INTERNAL_ERROR"
-    }
-}
-```
+| Condition                                      | HTTP | Error code       |
+|------------------------------------------------|------|------------------|
+| Flag does not exist                            | 404  | `NOT_FOUND`      |
+| Creating a flag whose name is already taken    | 409  | `ALREADY_EXISTS` |
+| Value type contradicts the flag's declared type | 400 | `TYPE_MISMATCH`  |
+| Name is empty, too long, or contains illegal characters | 400 | `INVALID_NAME` |
+| Value is missing, null, or wrong JSON kind     | 400  | `INVALID_VALUE`  |
 
-`errors.Is` unwraps chains correctly — a `fmt.Errorf("postgres: %w", domain.ErrNotFound)` still maps to 404 without leaking infrastructure detail into the response.
-
-### Infrastructure Errors
-
-| Situation | Handling |
-|-----------|----------|
-| Postgres connection lost | Propagated as infrastructure error → 503 |
-| Redis connection lost (read) | Cache adapter returns `domain.ErrNotFound` → triggers Postgres fallback → transparent to caller |
-| Redis connection lost (write) | Cache adapter returns non-domain error → service logs WARN, suppresses it → 200 returned |
-| Unknown DB error | Propagated → 500 |
-| Request body too large | Middleware enforces a max body size (e.g. 64 KB) → 413 |
+Infrastructure errors are handled separately: a Postgres failure returns 503; an unknown error returns 500. Redis failures on the write path are suppressed (logged at WARN level); Redis failures on the read path trigger a transparent Postgres fallback.
 
 ---
 
 ## 11. Testing Strategy
 
-Every `_test.go` file lives in the same directory as the file it tests. There is no top-level `test/` directory.
+**Unit tests** (`go test ./...`) use hand-written fakes for the port interfaces — no external processes needed. They cover all service logic branches (cache hit/miss, Redis soft-fail, type mismatch, not found) and all HTTP handler paths (status codes, JSON shapes, error codes).
 
-### Unit Tests — `go test ./...`
+**Integration tests** (`go test -tags integration ./...`) use `testcontainers-go` to spin up real Postgres and Redis containers. The Postgres adapter tests verify DB round-trips and constraint enforcement; the Redis adapter tests verify encoding/decoding and miss handling.
 
-No external dependencies. Hand-written fakes (preferred over generated mocks — the interfaces are small):
+**End-to-end tests** live in `cmd/server/` and exercise the full stack including write-through consistency, cache fallback and repopulation, and concurrent updates.
 
-**`internal/domain/flag_test.go`**
-- `FlagValue` zero-value correctness
-- Name validation rules (length, characters, empty)
-- Error sentinel identity via `errors.Is`
-
-**`internal/service/flag_service_test.go`** — fakes for `FlagStore` and `FlagCache`:
-
-| Test case | Assertion |
-|-----------|-----------|
-| `CreateFlag` happy path | Store.Save called, Cache.Set called, returned flag matches input |
-| `CreateFlag` invalid name | `ErrInvalidFlagName` returned, Store.Save not called |
-| `CreateFlag` already exists | `ErrAlreadyExists` propagated |
-| `CreateFlag` Redis Set fails | Store.Save succeeded, no error returned to caller |
-| `GetFlag` found | Store.FindByName called, result returned |
-| `GetFlag` not found | `ErrNotFound` propagated |
-| `GetFlagValue` cache hit | Store.FindByName NOT called |
-| `GetFlagValue` cache miss | Store.FindByName called, Cache.Set called |
-| `GetFlagValue` cache down + found in DB | Same as cache miss |
-| `GetFlagValue` cache down + not in DB | `ErrNotFound` propagated |
-| `UpdateFlagValue` happy path | Store.UpdateValue called, Cache.Set called |
-| `UpdateFlagValue` not found | `ErrNotFound` from store, Cache.Set not called |
-| `UpdateFlagValue` boolean type mismatch | `ErrTypeMismatch`, Store.UpdateValue not called |
-| `UpdateFlagValue` numeric type mismatch | `ErrTypeMismatch`, Store.UpdateValue not called |
-| `UpdateFlagValue` Redis Set fails | Store.UpdateValue succeeded, no error returned |
-
-**`internal/adapter/http/handler_test.go`** — fake `FlagService`, `net/http/httptest`:
-
-| Test | Assertion |
-|------|-----------|
-| POST /flags 201 | correct JSON shape |
-| POST /flags 400 bad name | error code `INVALID_NAME` |
-| POST /flags 400 unknown type | error code `INVALID_TYPE` |
-| POST /flags 409 | error code `ALREADY_EXISTS` |
-| GET /flags/:name 200 | all fields present including timestamps |
-| GET /flags/:name 404 | error code `NOT_FOUND` |
-| GET /flags/:name/value 200 boolean | `value` is JSON bool |
-| GET /flags/:name/value 200 numeric | `value` is JSON number |
-| GET /flags/:name/value 404 | error code `NOT_FOUND` |
-| PUT /flags/:name/value 200 | updated value in response |
-| PUT /flags/:name/value 400 type mismatch | error code `TYPE_MISMATCH` |
-| PUT /flags/:name/value 404 | error code `NOT_FOUND` |
-| Malformed JSON body | 400 `INVALID_VALUE` |
-| Unknown route | 404 |
-| Wrong HTTP method | 405 |
-
-### Integration Tests — `go test -tags integration ./...`
-
-Marked `//go:build integration`. Use `testcontainers-go` for ephemeral Postgres and Redis — no external `docker-compose` dependency in CI.
-
-**`internal/adapter/postgres/flag_store_test.go`:**
-- Save + FindByName round-trip (values survive DB serialisation)
-- Save duplicate name → `ErrAlreadyExists`
-- FindByName missing → `ErrNotFound`
-- UpdateValue boolean / numeric → correct column updated, `updated_at` bumped
-- UpdateValue missing → `ErrNotFound`
-- DB constraint: both value columns null → INSERT rejected
-- DB constraint: both value columns non-null → INSERT rejected
-
-**`internal/adapter/redis/flag_cache_test.go`:**
-- Set + Get boolean round-trip (`"b:true"` encodes/decodes correctly)
-- Set + Get numeric round-trip (`"n:30.5"` round-trips correctly)
-- Get missing key → `ErrNotFound`
-- Delete existing key → subsequent Get returns `ErrNotFound`
-- Delete missing key → no error
-
-**`cmd/server/main_test.go`** — full stack, real Postgres + Redis:
-- POST then GET — values match
-- POST then GET /value — cache populated on create
-- PUT /value then GET /value — cache updated
-- Force-delete Redis key, GET /value — Postgres fallback works, cache re-populated
-- Concurrent PUT /value — last writer wins, no corruption (10 goroutines, final DB and cache agree)
-
-### Shared Test Helpers
-
-`internal/testutil/db.go` and `internal/testutil/redis.go` provide container lifecycle management importable by any `internal/` integration test.
-
-### CI Commands
-
-```
-go test ./...                       # unit tests only
-go test -tags integration ./...     # unit + integration tests
-go test -race ./...                 # data race detection
-go test -cover ./...                # coverage report (target ≥85% on internal/service/)
-```
+CI runs `go test -race ./...` for data race detection and `go test -cover ./...` for coverage (target ≥ 85% on the service layer).
 
 ---
 
@@ -549,27 +199,7 @@ go test -cover ./...                # coverage report (target ≥85% on internal
 
 | Package | Purpose |
 |---------|---------|
-| `github.com/jackc/pgx/v5` | Postgres driver — superior context support and type safety; no ORM |
+| `github.com/jackc/pgx/v5` | Postgres driver — strong context support and type safety; no ORM |
 | `github.com/redis/go-redis/v9` | Redis client |
-| `github.com/testcontainers/testcontainers-go` | Ephemeral containers for integration tests |
-| `github.com/stretchr/testify` | Test assertion helpers (optional) |
-
-Standard library `net/http` with the Go 1.22 mux (path parameter support built-in) is sufficient — no HTTP framework needed.
-
----
-
-## 13. Composition Root (`cmd/server/main.go`)
-
-```
-main()
-  ├── Load config (env vars via internal/config)
-  ├── Open *pgxpool.Pool  (Postgres connection pool)
-  ├── Open *redis.Client  (Redis client)
-  ├── Construct postgres.FlagStore  (implements port.FlagStore)
-  ├── Construct redis.FlagCache     (implements port.FlagCache)
-  ├── Construct service.FlagService (implements port.FlagService)
-  ├── Construct http.Handler        (primary adapter, consumes port.FlagService)
-  └── http.ListenAndServe(addr, router)
-```
-
-All dependency wiring is explicit and happens in one place. No dependency injection framework is used.
+| `github.com/testcontainers/testcontainers-go` | Ephemeral Postgres and Redis containers for integration tests |
+| `github.com/stretchr/testify` | Test assertion helpers |
