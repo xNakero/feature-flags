@@ -19,20 +19,6 @@ type FlagValue struct {
 	Numeric *float64
 }
 
-// Type returns the FlagType corresponding to the non-nil field.
-// It panics if both fields are nil (invalid state).
-func (v FlagValue) Type() FlagType {
-	if v.Bool != nil {
-		return FlagTypeBoolean
-	}
-	return FlagTypeNumeric
-}
-
-// IsZero reports whether the FlagValue is uninitialized (both fields nil).
-func (v FlagValue) IsZero() bool {
-	return v.Bool == nil && v.Numeric == nil
-}
-
 // Flag represents a feature flag domain entity.
 type Flag struct {
 	Name        string
