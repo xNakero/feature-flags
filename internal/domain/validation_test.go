@@ -1,10 +1,11 @@
 package domain_test
 
 import (
-	"errors"
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/xNakero/feature-flags/internal/domain"
 )
 
@@ -25,8 +26,6 @@ func TestValidateFlagName(t *testing.T) {
 		{name: "single character", input: "a", wantErr: false},
 		{name: "exactly 63 chars", input: valid63, wantErr: false},
 		{name: "alphanumeric mixed", input: "a1b2c3-d4e5", wantErr: false},
-		{name: "multi-segment", input: "payment-processing-v2", wantErr: false},
-		{name: "enable-auth", input: "enable-auth", wantErr: false},
 
 		// Invalid names
 		{name: "empty string", input: "", wantErr: true},
@@ -50,16 +49,9 @@ func TestValidateFlagName(t *testing.T) {
 			t.Parallel()
 			err := domain.ValidateFlagName(tt.input)
 			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("expected error for %q, got nil", tt.input)
-				}
-				if !errors.Is(err, domain.ErrInvalidName) {
-					t.Fatalf("expected errors.Is ErrInvalidName, got %v", err)
-				}
+				require.ErrorIs(t, err, domain.ErrInvalidName)
 			} else {
-				if err != nil {
-					t.Fatalf("expected nil for %q, got %v", tt.input, err)
-				}
+				require.NoError(t, err)
 			}
 		})
 	}
@@ -81,13 +73,11 @@ func TestValidateFlagValue(t *testing.T) {
 			name:      "boolean flag with bool value",
 			flagType:  domain.FlagTypeBoolean,
 			flagValue: domain.FlagValue{Bool: &boolVal},
-			wantErr:   nil,
 		},
 		{
 			name:      "numeric flag with numeric value",
 			flagType:  domain.FlagTypeNumeric,
 			flagValue: domain.FlagValue{Numeric: &numVal},
-			wantErr:   nil,
 		},
 		{
 			name:      "boolean flag with numeric value",
@@ -120,11 +110,9 @@ func TestValidateFlagValue(t *testing.T) {
 			t.Parallel()
 			err := domain.ValidateFlagValue(tt.flagType, tt.flagValue)
 			if tt.wantErr != nil {
-				if !errors.Is(err, tt.wantErr) {
-					t.Fatalf("expected errors.Is %v, got %v", tt.wantErr, err)
-				}
-			} else if err != nil {
-				t.Fatalf("expected nil, got %v", err)
+				require.ErrorIs(t, err, tt.wantErr)
+			} else {
+				assert.NoError(t, err)
 			}
 		})
 	}

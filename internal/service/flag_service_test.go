@@ -2,9 +2,10 @@ package service_test
 
 import (
 	"context"
-	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/xNakero/feature-flags/internal/domain"
 	"github.com/xNakero/feature-flags/internal/port"
 	"github.com/xNakero/feature-flags/internal/service"
@@ -55,7 +56,6 @@ func TestService_CreateFlag(t *testing.T) {
 		name        string
 		req         port.CreateFlagRequest
 		wantErr     error
-		wantNoErr   bool
 		wantName    string
 		wantType    string
 		wantDesc    string
@@ -70,12 +70,10 @@ func TestService_CreateFlag(t *testing.T) {
 				Description: "a boolean flag",
 				Value:       port.FlagValue{Bool: &boolVal},
 			},
-			wantNoErr:   true,
-			wantName:    "my-flag",
-			wantType:    "boolean",
-			wantDesc:    "a boolean flag",
-			wantBool:    &boolVal,
-			wantNumeric: nil,
+			wantName: "my-flag",
+			wantType: "boolean",
+			wantDesc: "a boolean flag",
+			wantBool: &boolVal,
 		},
 		{
 			name: "valid numeric flag",
@@ -85,11 +83,9 @@ func TestService_CreateFlag(t *testing.T) {
 				Description: "a numeric flag",
 				Value:       port.FlagValue{Numeric: &numVal},
 			},
-			wantNoErr:   true,
 			wantName:    "rate-limit",
 			wantType:    "numeric",
 			wantDesc:    "a numeric flag",
-			wantBool:    nil,
 			wantNumeric: &numVal,
 		},
 		{
@@ -172,7 +168,6 @@ func TestService_CreateFlag(t *testing.T) {
 
 			store := newFakeFlagStore()
 
-			// Pre-seed a flag so duplicate detection works.
 			if tt.wantErr == domain.ErrAlreadyExists {
 				_ = store.Create(context.Background(), domain.Flag{
 					Name:  tt.req.Name,
@@ -185,45 +180,24 @@ func TestService_CreateFlag(t *testing.T) {
 			resp, err := svc.CreateFlag(context.Background(), tt.req)
 
 			if tt.wantErr != nil {
-				if !errors.Is(err, tt.wantErr) {
-					t.Fatalf("expected errors.Is %v, got %v", tt.wantErr, err)
-				}
-				if resp != nil {
-					t.Fatal("expected nil response on error")
-				}
+				require.ErrorIs(t, err, tt.wantErr)
+				assert.Nil(t, resp)
 				return
 			}
 
-			if !tt.wantNoErr {
-				return
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			assert.Equal(t, tt.wantName, resp.Name)
+			assert.Equal(t, tt.wantType, resp.Type)
+			assert.Equal(t, tt.wantDesc, resp.Description)
+			if tt.wantBool != nil {
+				assert.Equal(t, tt.wantBool, resp.Value.Bool)
 			}
-			if err != nil {
-				t.Fatalf("expected nil error, got %v", err)
+			if tt.wantNumeric != nil {
+				assert.Equal(t, tt.wantNumeric, resp.Value.Numeric)
 			}
-			if resp == nil {
-				t.Fatal("expected non-nil response")
-			}
-			if resp.Name != tt.wantName {
-				t.Errorf("Name: got %q, want %q", resp.Name, tt.wantName)
-			}
-			if resp.Type != tt.wantType {
-				t.Errorf("Type: got %q, want %q", resp.Type, tt.wantType)
-			}
-			if resp.Description != tt.wantDesc {
-				t.Errorf("Description: got %q, want %q", resp.Description, tt.wantDesc)
-			}
-			if tt.wantBool != nil && (resp.Value.Bool == nil || *resp.Value.Bool != *tt.wantBool) {
-				t.Errorf("Value.Bool: got %v, want %v", resp.Value.Bool, tt.wantBool)
-			}
-			if tt.wantNumeric != nil && (resp.Value.Numeric == nil || *resp.Value.Numeric != *tt.wantNumeric) {
-				t.Errorf("Value.Numeric: got %v, want %v", resp.Value.Numeric, tt.wantNumeric)
-			}
-			if resp.CreatedAt.IsZero() {
-				t.Error("CreatedAt should not be zero")
-			}
-			if resp.UpdatedAt.IsZero() {
-				t.Error("UpdatedAt should not be zero")
-			}
+			assert.False(t, resp.CreatedAt.IsZero())
+			assert.False(t, resp.UpdatedAt.IsZero())
 		})
 	}
 }
